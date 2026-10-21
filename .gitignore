@@ -1,0 +1,48 @@
+## Ignore Visual Studio / .NET temporary files, build results, and user files
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio / Rider / VS Code cache & user files
+.vs/
+.idea/
+.vscode/
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+# NuGet Packages & lock files
+*.nupkg
+*.snupkg
+**/[Pp]ackages/*
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Never commit proprietary OMDS / Olympus SDK binaries
+*.dll
+*.pdb
+*.exe
+*.orf
+*.ORF
+*.fits
+*.fit
+
+# Temporary / scratch folders
+InspectNina/
+NINAInspector/
+scripts/

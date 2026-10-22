@@ -52,6 +52,9 @@ jobs:
       - name: Build Release (x64)
         run: dotnet build NINA.Plugin.OMCamera.sln -c Release --no-restore
 
+      - name: Run Regression Tests (x64)
+        run: dotnet test NINA.Plugin.OMCamera.Tests/NINA.Plugin.OMCamera.Tests.csproj -c Release --no-build --verbosity normal
+
       - name: Package plugin artifacts & generate NINA manifest.json
         shell: pwsh
         run: |
@@ -59,7 +62,7 @@ jobs:
           $shaShort = "${{ github.sha }}".Substring(0, 7)
           $versionLabel = if ($refName -like "v*") { $refName } else { "dev-$shaShort" }
 
-          $tag = if ($refName -like "v*") { $refName.TrimStart('v') } else { "1.1.0.0" }
+          $tag = if ($refName -like "v*") { $refName.TrimStart('v') } else { "1.2.0.0" }
           $parts = $tag.Split('-')[0].Split('.')
           while ($parts.Count -lt 4) { $parts += "0" }
 
@@ -102,9 +105,9 @@ jobs:
             Tags = @("Camera", "OM System", "Olympus", "OM-1", "Mirrorless", "DSLR")
             MinimumApplicationVersion = [ordered]@{
               Major = 3
-              Minor = 0
+              Minor = 2
               Patch = 0
-              Build = 2017
+              Build = 9001
             }
             Descriptions = [ordered]@{
               ShortDescription = "Native camera driver for OM System and Olympus mirrorless cameras in N.I.N.A."

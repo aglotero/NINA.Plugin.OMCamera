@@ -4,6 +4,8 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NINA.Plugin.OMCamera", "NINA.Plugin.OMCamera\NINA.Plugin.OMCamera.csproj", "{E5F039A8-9D21-4F11-9A99-4D6423CA6E77}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NINA.Plugin.OMCamera.Tests", "NINA.Plugin.OMCamera.Tests\NINA.Plugin.OMCamera.Tests.csproj", "{8B42D1E5-6A19-4E3C-A7F2-91C8D3E4F5A6}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -14,5 +16,9 @@ Global
 		{E5F039A8-9D21-4F11-9A99-4D6423CA6E77}.Debug|x64.Build.0 = Debug|x64
 		{E5F039A8-9D21-4F11-9A99-4D6423CA6E77}.Release|x64.ActiveCfg = Release|x64
 		{E5F039A8-9D21-4F11-9A99-4D6423CA6E77}.Release|x64.Build.0 = Release|x64
+		{8B42D1E5-6A19-4E3C-A7F2-91C8D3E4F5A6}.Debug|x64.ActiveCfg = Debug|x64
+		{8B42D1E5-6A19-4E3C-A7F2-91C8D3E4F5A6}.Debug|x64.Build.0 = Debug|x64
+		{8B42D1E5-6A19-4E3C-A7F2-91C8D3E4F5A6}.Release|x64.ActiveCfg = Release|x64
+		{8B42D1E5-6A19-4E3C-A7F2-91C8D3E4F5A6}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 EndGlobal

@@ -1,17 +1,19 @@
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 [assembly: ComVisible(false)]
+[assembly: InternalsVisibleTo("NINA.Plugin.OMCamera.Tests")]
 [assembly: Guid("e5f039a8-9d21-4f11-9a99-4d6423ca6e77")]
 [assembly: AssemblyTitle("OM System Camera")]
 [assembly: AssemblyDescription("Native camera driver for OM System and Olympus cameras in N.I.N.A.")]
 [assembly: AssemblyCompany("OM Camera Contributors")]
 [assembly: AssemblyProduct("NINA.Plugin.OMCamera")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
 
-[assembly: AssemblyMetadata("MinimumApplicationVersion", "3.0.0.0")]
+[assembly: AssemblyMetadata("MinimumApplicationVersion", "3.2.0.9001")]
 [assembly: AssemblyMetadata("License", "MIT")]
 [assembly: AssemblyMetadata("LicenseURL", "https://opensource.org/licenses/MIT")]
 [assembly: AssemblyMetadata("Repository", "https://github.com/aglotero/NINA.Plugin.OMCamera")]

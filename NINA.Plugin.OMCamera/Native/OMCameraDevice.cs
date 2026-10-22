@@ -37,15 +37,10 @@ namespace NINA.Plugin.OMCamera.Native
 
         private readonly ManualResetEventSlim _captureReadyEvent = new ManualResetEventSlim(false);
         private readonly ManualResetEventSlim _objectAddedEvent = new ManualResetEventSlim(false);
-        private readonly ManualResetEventSlim _recviewReadyEvent = new ManualResetEventSlim(false);
         private readonly ManualResetEventSlim _liveViewFrameEvent = new ManualResetEventSlim(false);
         private readonly object _imageLock = new object();
         private byte[]? _lastCapturedBytes;
-        private byte[]? _lastRecviewBytes;
         private byte[]? _latestLiveViewJpeg;
-
-        [DllImport(@"C:\Program Files (x86)\OMDS\OM Workspace\OlyCameraLib.dll", CallingConvention = CallingConvention.Cdecl, EntryPoint = "OlyCamLib_CreateMemory")]
-        private static extern int Raw_OlyCamLib_CreateMemory(out IntPtr ppMemory, uint size);
 
         // COM IUnknown delegates
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
@@ -234,23 +229,7 @@ namespace NINA.Plugin.OMCamera.Native
 
             _didReceiveRecviewDel = (IntPtr pThis, IntPtr pCam, IntPtr pMemory, IntPtr pDict) =>
             {
-                try
-                {
-                    byte[]? data = ExtractBytesFromOlyMemory(pMemory);
-                    if (data != null && data.Length > 0)
-                    {
-                        Logger.Info($"OMCameraDevice: Received Recview preview image ({data.Length} bytes).");
-                        lock (_imageLock)
-                        {
-                            _lastRecviewBytes = data;
-                        }
-                        _recviewReadyEvent.Set();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Logger.Warning($"OMCameraDevice: Error in OnDidReceiveCapturedImagePreview: {ex.Message}");
-                }
+                // Preview/Recview JPEGs are never used as substitute data for still exposures.
                 return 0;
             };
 
@@ -278,17 +257,20 @@ namespace NINA.Plugin.OMCamera.Native
                     byte[]? data = ExtractBytesFromOlyMemory(pMemory);
                     if (data != null && data.Length > 0)
                     {
-                        bool isOrf = data.Length > 4 && data[0] == 0x49 && data[1] == 0x49;
-                        Logger.Info($"OMCameraDevice: Downloaded captured image from camera ({data.Length} bytes, format={(isOrf ? "ORF" : "JPEG")}).");
+                        bool isOrf = OrfRawProcessor.IsValidOrfHeader(data);
+                        Logger.Info($"OMCameraDevice: Downloaded captured image from camera ({data.Length} bytes, format={(isOrf ? "ORF" : "Non-ORF")}).");
                         lock (_imageLock)
                         {
-                            // If RAW+JPEG is enabled on camera, prefer ORF or keep latest if none stored yet
+                            // In RAW+JPEG mode, always prefer and retain the .ORF RAW payload
                             if (_lastCapturedBytes == null || isOrf)
                             {
                                 _lastCapturedBytes = data;
                             }
                         }
-                        _captureReadyEvent.Set();
+                        if (isOrf)
+                        {
+                            _captureReadyEvent.Set();
+                        }
                     }
                     else
                     {
@@ -322,8 +304,8 @@ namespace NINA.Plugin.OMCamera.Native
                     byte[]? data = ExtractBytesFromOlyMemory(pMemory);
                     if (data != null && data.Length > 0)
                     {
-                        bool isOrf = data.Length > 4 && data[0] == 0x49 && data[1] == 0x49;
-                        Logger.Info($"OMCameraDevice: OnDownloadComplete received image ({data.Length} bytes, format={(isOrf ? "ORF" : "JPEG")}).");
+                        bool isOrf = OrfRawProcessor.IsValidOrfHeader(data);
+                        Logger.Info($"OMCameraDevice: OnDownloadComplete received image ({data.Length} bytes, format={(isOrf ? "ORF" : "Non-ORF")}).");
                         lock (_imageLock)
                         {
                             if (_lastCapturedBytes == null || isOrf)
@@ -331,7 +313,10 @@ namespace NINA.Plugin.OMCamera.Native
                                 _lastCapturedBytes = data;
                             }
                         }
-                        _captureReadyEvent.Set();
+                        if (isOrf)
+                        {
+                            _captureReadyEvent.Set();
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -604,29 +589,6 @@ namespace NINA.Plugin.OMCamera.Native
             catch { }
         }
 
-        /// <summary>
-        /// For composite property wrappers in OlyCameraLib.dll (0x202 ApertureProp vtable *EDE0,
-        /// 0x21C ShutterProp vtable *AF88), offset +0x08 holds the raw underlying IOlyCameraProperty*
-        /// before min/max range clamping by 0x27E/0x27F or 0x285/0x286.
-        /// </summary>
-        private static IntPtr GetUnderlyingProperty(IntPtr pProp)
-        {
-            if (pProp == IntPtr.Zero) return IntPtr.Zero;
-            try
-            {
-                long vtbl = Marshal.ReadIntPtr(pProp).ToInt64();
-                long low16 = vtbl & 0xFFFF;
-                if (low16 == 0xEDE0 || low16 == 0xAF88)
-                {
-                    IntPtr pInner = Marshal.ReadIntPtr(pProp, 0x08);
-                    if (pInner != IntPtr.Zero)
-                        return pInner;
-                }
-            }
-            catch { }
-            return pProp;
-        }
-
         public readonly struct ApertureEntry
         {
             public uint Code { get; }
@@ -673,48 +635,36 @@ namespace NINA.Plugin.OMCamera.Native
             if (_pCamera == IntPtr.Zero) return result;
 
             IntPtr pProp = IntPtr.Zero;
+            IntPtr pEnum = IntPtr.Zero;
             try
             {
                 var getProp = GetMethod<GetCameraPropertyValueDelegate>(16);
                 int hr = getProp(_pCamera, PROP_APERTURE_VALUE, out pProp);
                 if (hr != 0 || pProp == IntPtr.Zero) return result;
 
-                IntPtr pInner = GetUnderlyingProperty(pProp);
-                foreach (IntPtr candidateProp in (pInner != pProp ? new[] { pProp, pInner } : new[] { pProp }))
+                IntPtr propVtbl = Marshal.ReadIntPtr(pProp);
+                var getEnum = Marshal.GetDelegateForFunctionPointer<PropGetEnumListDelegate>(Marshal.ReadIntPtr(propVtbl, 9 * IntPtr.Size));
+                if (getEnum(pProp, out pEnum) == 0 && pEnum != IntPtr.Zero)
                 {
-                    IntPtr pEnum = IntPtr.Zero;
-                    try
+                    IntPtr enumVtbl = Marshal.ReadIntPtr(pEnum);
+                    var getCount = Marshal.GetDelegateForFunctionPointer<EnumGetCountDelegate>(Marshal.ReadIntPtr(enumVtbl, 3 * IntPtr.Size));
+                    var getItem = Marshal.GetDelegateForFunctionPointer<EnumGetItemDelegate>(Marshal.ReadIntPtr(enumVtbl, 4 * IntPtr.Size));
+                    if (getCount(pEnum, out uint count) == 0 && count > 0)
                     {
-                        IntPtr propVtbl = Marshal.ReadIntPtr(candidateProp);
-                        var getEnum = Marshal.GetDelegateForFunctionPointer<PropGetEnumListDelegate>(Marshal.ReadIntPtr(propVtbl, 9 * IntPtr.Size));
-                        if (getEnum(candidateProp, out pEnum) == 0 && pEnum != IntPtr.Zero)
+                        for (uint i = 0; i < count; i++)
                         {
-                            IntPtr enumVtbl = Marshal.ReadIntPtr(pEnum);
-                            var getCount = Marshal.GetDelegateForFunctionPointer<EnumGetCountDelegate>(Marshal.ReadIntPtr(enumVtbl, 3 * IntPtr.Size));
-                            var getItem = Marshal.GetDelegateForFunctionPointer<EnumGetItemDelegate>(Marshal.ReadIntPtr(enumVtbl, 4 * IntPtr.Size));
-                            if (getCount(pEnum, out uint count) == 0 && count > 0)
+                            if (getItem(pEnum, i, out uint code) == 0)
                             {
-                                for (uint i = 0; i < count; i++)
+                                if (code == 0 || code == 0xFFFF || code == 0xFFFFFFFF)
+                                    continue;
+                                var entry = DecodeApertureCode(code);
+                                if (entry.FStop >= 0.7 && entry.FStop <= 64.0 && !result.Exists(e => e.Code == entry.Code))
                                 {
-                                    if (getItem(pEnum, i, out uint code) == 0)
-                                    {
-                                        if (code == 0 || code == 0xFFFF || code == 0xFFFFFFFF)
-                                            continue;
-                                        var entry = DecodeApertureCode(code);
-                                        if (entry.FStop >= 0.7 && entry.FStop <= 64.0 && !result.Exists(e => e.Code == entry.Code))
-                                        {
-                                            result.Add(entry);
-                                        }
-                                    }
+                                    result.Add(entry);
                                 }
                             }
                         }
                     }
-                    finally
-                    {
-                        SafeReleaseCom(pEnum);
-                    }
-                    if (result.Count > 0) break;
                 }
 
                 result.Sort((a, b) => a.FStop.CompareTo(b.FStop));
@@ -725,6 +675,7 @@ namespace NINA.Plugin.OMCamera.Native
             }
             finally
             {
+                SafeReleaseCom(pEnum);
                 SafeReleaseCom(pProp);
             }
             return result;
@@ -740,15 +691,11 @@ namespace NINA.Plugin.OMCamera.Native
                 int hr = getProp(_pCamera, PROP_APERTURE_VALUE, out pProp);
                 if (hr != 0 || pProp == IntPtr.Zero) return 0;
 
-                IntPtr pInner = GetUnderlyingProperty(pProp);
-                foreach (IntPtr candidateProp in (pInner != pProp ? new[] { pProp, pInner } : new[] { pProp }))
+                IntPtr propVtbl = Marshal.ReadIntPtr(pProp);
+                var getVal = Marshal.GetDelegateForFunctionPointer<PropGetValueDelegate>(Marshal.ReadIntPtr(propVtbl, 6 * IntPtr.Size));
+                if (getVal(pProp, out uint rawVal) == 0 && rawVal != 0 && rawVal != 0xFFFF && rawVal != 0xFFFFFFFF)
                 {
-                    IntPtr propVtbl = Marshal.ReadIntPtr(candidateProp);
-                    var getVal = Marshal.GetDelegateForFunctionPointer<PropGetValueDelegate>(Marshal.ReadIntPtr(propVtbl, 6 * IntPtr.Size));
-                    if (getVal(candidateProp, out uint rawVal) == 0 && rawVal != 0 && rawVal != 0xFFFF && rawVal != 0xFFFFFFFF)
-                    {
-                        return rawVal;
-                    }
+                    return rawVal;
                 }
             }
             catch { }
@@ -797,14 +744,8 @@ namespace NINA.Plugin.OMCamera.Native
                 int hrSetVal = setVal(pProp, matchedCode);
                 if (hrSetVal != 0)
                 {
-                    IntPtr pInner = GetUnderlyingProperty(pProp);
-                    if (pInner != IntPtr.Zero && pInner != pProp)
-                    {
-                        IntPtr innerVtbl = Marshal.ReadIntPtr(pInner);
-                        var setInnerVal = Marshal.GetDelegateForFunctionPointer<PropSetValueDelegate>(Marshal.ReadIntPtr(innerVtbl, 7 * IntPtr.Size));
-                        hrSetVal = setInnerVal(pInner, matchedCode);
-                        Marshal.WriteInt32(pProp, 0x20, (int)matchedCode);
-                    }
+                    Logger.Warning($"OMCameraDevice: IOlyPropertyValue::SetValue(0x{matchedCode:X}) failed hr=0x{hrSetVal:X}");
+                    return false;
                 }
 
                 var setProp = GetMethod<SetCameraPropertyValueDelegate>(15);
@@ -1098,11 +1039,9 @@ namespace NINA.Plugin.OMCamera.Native
             lock (_imageLock)
             {
                 _lastCapturedBytes = null;
-                _lastRecviewBytes = null;
             }
             _captureReadyEvent.Reset();
             _objectAddedEvent.Reset();
-            _recviewReadyEvent.Reset();
         }
 
         public bool StartBulbExposure()
@@ -1244,15 +1183,6 @@ namespace NINA.Plugin.OMCamera.Native
             if (fallback != null && fallback.Length > 0)
                 return fallback;
 
-            // Final fallback: return the Recview JPEG if no SD card was present or full download failed
-            lock (_imageLock)
-            {
-                if (_lastRecviewBytes != null && _lastRecviewBytes.Length > 0)
-                {
-                    Logger.Info($"OMCameraDevice: Using Recview preview image fallback ({_lastRecviewBytes.Length} bytes).");
-                    return _lastRecviewBytes;
-                }
-            }
             return null;
         }
 

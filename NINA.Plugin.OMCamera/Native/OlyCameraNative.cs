@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -12,6 +13,31 @@ namespace NINA.Plugin.OMCamera.Native
     {
         private const string DLL_NAME = "OlyCameraLib.dll";
 
+        // Supported OlyCameraLib.dll build shipped with OM Workspace (64-bit):
+        // - Exported OlyCamLib_Version: 1.1.49 (0x01, 0x01, 0x31)
+        // - PE FileVersionInfo: 1.1.0.49 (491,008 bytes, SHA-256: 690A944736F613CCFFADB1AFD0AD2F35E6F842081230C1262B7A269AB68CBB4C)
+        public const uint SupportedApiMajor = 1;
+        public const uint SupportedApiMinor = 1;
+        public const uint SupportedApiBuild = 49;
+
+        public const int SupportedFileMajor = 1;
+        public const int SupportedFileMinor = 1;
+        public const int SupportedFileBuild = 0;
+        public const int SupportedFilePrivate = 49;
+
+        // Verified RVAs in OlyCameraLib.dll 1.1.0.49 (API 1.1.49) that establish the layout of
+        // COlyCameraCtrlManager::m_bHasLocModel at offset +0x80:
+        // - RVA 0x35A4F (COlyCameraCtrlManager ctor): 41 C6 87 80 00 00 00 01  (mov BYTE PTR [r15+0x80], 0x1)
+        // - RVA 0x3833D (COlyCameraCtrlManager::IsModelSupported): 80 B9 80 00 00 00 01 (cmp BYTE PTR [rcx+0x80], 0x1)
+        public const int RvaManagerCtorLocModelWrite = 0x35A4F;
+        public const int RvaManagerIsModelSupportedCheck = 0x3833D;
+
+        private static readonly byte[] ExpectedCtorLocModelBytes = { 0x41, 0xC6, 0x87, 0x80, 0x00, 0x00, 0x00, 0x01 };
+        private static readonly byte[] ExpectedCheckLocModelBytes = { 0x80, 0xB9, 0x80, 0x00, 0x00, 0x00, 0x01 };
+
+        public static ReadOnlySpan<byte> ExpectedCtorInstruction => ExpectedCtorLocModelBytes;
+        public static ReadOnlySpan<byte> ExpectedCheckInstruction => ExpectedCheckLocModelBytes;
+
         [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern IntPtr LoadLibrary(string lpLibFileName);
 
@@ -20,14 +46,6 @@ namespace NINA.Plugin.OMCamera.Native
 
         [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern bool SetDllDirectory(string lpPathName);
-
-        [DllImport("kernel32.dll")]
-        private static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
-
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
-        private delegate void OlyLogOutputDelegate([MarshalAs(UnmanagedType.LPWStr)] string msg);
-
-        private static OlyLogOutputDelegate? _logHook;
 
         [DllImport(DLL_NAME, CallingConvention = CallingConvention.Cdecl, EntryPoint = "OlyCamLib_Initialize")]
         private static extern int Raw_OlyCamLib_Initialize([MarshalAs(UnmanagedType.LPStr)] string licenseKey);
@@ -42,6 +60,98 @@ namespace NINA.Plugin.OMCamera.Native
         public static extern int OlyCamLib_Version(out uint major, out uint minor, out uint build);
 
         public const uint PROP_APERTURE_VALUE = 0x202;
+
+        /// <summary>
+        /// Validates that the loaded OlyCameraLib.dll matches the supported API and PE file version before
+        /// invoking internal COM interfaces or applying the manager initialization fix.
+        /// </summary>
+        public static bool ValidateNativeLibraryVersion(
+            uint apiMajor,
+            uint apiMinor,
+            uint apiBuild,
+            int fileMajor,
+            int fileMinor,
+            int fileBuild,
+            int filePrivate,
+            out string errorMessage)
+        {
+            if (apiMajor != SupportedApiMajor || apiMinor != SupportedApiMinor || apiBuild != SupportedApiBuild)
+            {
+                errorMessage =
+                    $"Unsupported OlyCameraLib.dll SDK version {apiMajor}.{apiMinor}.{apiBuild}. " +
+                    $"Expected SDK version {SupportedApiMajor}.{SupportedApiMinor}.{SupportedApiBuild}.";
+                return false;
+            }
+
+            if (fileMajor != SupportedFileMajor ||
+                fileMinor != SupportedFileMinor ||
+                fileBuild != SupportedFileBuild ||
+                filePrivate != SupportedFilePrivate)
+            {
+                errorMessage =
+                    $"Unsupported OlyCameraLib.dll file version {fileMajor}.{fileMinor}.{fileBuild}.{filePrivate}. " +
+                    $"Expected file version {SupportedFileMajor}.{SupportedFileMinor}.{SupportedFileBuild}.{SupportedFilePrivate}.";
+                return false;
+            }
+
+            errorMessage = string.Empty;
+            return true;
+        }
+
+        /// <summary>
+        /// Verifies the exact instruction opcodes at RVA 0x35A4F and RVA 0x3833D that access
+        /// COlyCameraCtrlManager::m_bHasLocModel at offset +0x80 before touching that offset.
+        /// </summary>
+        public static bool ValidateLocModelSignature(
+            ReadOnlySpan<byte> ctorInstrBytes,
+            ReadOnlySpan<byte> checkInstrBytes,
+            out string errorMessage)
+        {
+            if (!ctorInstrBytes.SequenceEqual(ExpectedCtorLocModelBytes))
+            {
+                errorMessage =
+                    $"OlyCameraLib.dll instruction signature mismatch at RVA 0x{RvaManagerCtorLocModelWrite:X}. " +
+                    "Refusing to modify COlyCameraCtrlManager offset +0x80 on an unrecognized binary layout.";
+                return false;
+            }
+
+            if (!checkInstrBytes.SequenceEqual(ExpectedCheckLocModelBytes))
+            {
+                errorMessage =
+                    $"OlyCameraLib.dll instruction signature mismatch at RVA 0x{RvaManagerIsModelSupportedCheck:X}. " +
+                    "Refusing to modify COlyCameraCtrlManager offset +0x80 on an unrecognized binary layout.";
+                return false;
+            }
+
+            errorMessage = string.Empty;
+            return true;
+        }
+
+        /// <summary>
+        /// Throws <see cref="NotSupportedException"/> if either the native library version or instruction signature
+        /// does not match the verified OlyCameraLib.dll build.
+        /// </summary>
+        public static void EnsureSupportedNativeLibrary(
+            uint apiMajor,
+            uint apiMinor,
+            uint apiBuild,
+            int fileMajor,
+            int fileMinor,
+            int fileBuild,
+            int filePrivate,
+            ReadOnlySpan<byte> ctorInstrBytes,
+            ReadOnlySpan<byte> checkInstrBytes)
+        {
+            if (!ValidateNativeLibraryVersion(apiMajor, apiMinor, apiBuild, fileMajor, fileMinor, fileBuild, filePrivate, out string verErr))
+            {
+                throw new NotSupportedException(verErr);
+            }
+
+            if (!ValidateLocModelSignature(ctorInstrBytes, checkInstrBytes, out string sigErr))
+            {
+                throw new NotSupportedException(sigErr);
+            }
+        }
 
         private static string? ResolveOlyCameraLibPath()
         {
@@ -149,33 +259,69 @@ namespace NINA.Plugin.OMCamera.Native
                     return false;
                 }
 
+                FileVersionInfo fvi;
+                try
+                {
+                    fvi = FileVersionInfo.GetVersionInfo(dllPath);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"OlyCameraNative: Failed to read FileVersionInfo for '{dllPath}': {ex.Message}");
+                    return false;
+                }
+
                 if (!_isLoaded)
                 {
                     string dir = Path.GetDirectoryName(dllPath)!;
                     SetDllDirectory(dir);
                     Environment.SetEnvironmentVariable("PATH", dir + ";" + Environment.GetEnvironmentVariable("PATH"));
-                    IntPtr hMod = LoadLibrary(dllPath);
-                    if (hMod != IntPtr.Zero)
+                    IntPtr hLoaded = LoadLibrary(dllPath);
+                    if (hLoaded == IntPtr.Zero)
                     {
-                        try
-                        {
-                            // Level 4 logs SDK Call, Information, Warning, and Error without 10Hz polling spam
-                            Marshal.WriteInt32(hMod + 0x72568, 4);
-                            _logHook = (msg) =>
-                            {
-                                if (!string.IsNullOrWhiteSpace(msg))
-                                    Logger.Info($"[OlyLog] {msg.TrimEnd()}");
-                            };
-                            IntPtr pIat = hMod + 0x51258;
-                            if (VirtualProtect(pIat, (UIntPtr)8, 0x04 /* PAGE_READWRITE */, out uint oldProt))
-                            {
-                                Marshal.WriteIntPtr(pIat, Marshal.GetFunctionPointerForDelegate(_logHook));
-                                VirtualProtect(pIat, (UIntPtr)8, oldProt, out _);
-                            }
-                        }
-                        catch { }
+                        Logger.Error($"OlyCameraNative: LoadLibrary failed for '{dllPath}' (Win32 error {Marshal.GetLastWin32Error()}).");
+                        return false;
                     }
                     _isLoaded = true;
+                }
+
+                uint apiMaj = 0, apiMin = 0, apiBld = 0;
+                int hrVer = OlyCamLib_Version(out apiMaj, out apiMin, out apiBld);
+                if (hrVer != 0)
+                {
+                    Logger.Error($"OlyCameraNative: OlyCamLib_Version failed with hr=0x{hrVer:X}.");
+                    return false;
+                }
+
+                if (!ValidateNativeLibraryVersion(
+                        apiMaj,
+                        apiMin,
+                        apiBld,
+                        fvi.FileMajorPart,
+                        fvi.FileMinorPart,
+                        fvi.FileBuildPart,
+                        fvi.FilePrivatePart,
+                        out string verError))
+                {
+                    Logger.Error($"OlyCameraNative: {verError}");
+                    return false;
+                }
+
+                IntPtr hMod = GetModuleHandle(DLL_NAME);
+                if (hMod == IntPtr.Zero)
+                {
+                    Logger.Error("OlyCameraNative: GetModuleHandle(OlyCameraLib.dll) returned null after loading.");
+                    return false;
+                }
+
+                byte[] ctorBytes = new byte[ExpectedCtorLocModelBytes.Length];
+                byte[] checkBytes = new byte[ExpectedCheckLocModelBytes.Length];
+                Marshal.Copy(hMod + RvaManagerCtorLocModelWrite, ctorBytes, 0, ctorBytes.Length);
+                Marshal.Copy(hMod + RvaManagerIsModelSupportedCheck, checkBytes, 0, checkBytes.Length);
+
+                if (!ValidateLocModelSignature(ctorBytes, checkBytes, out string sigError))
+                {
+                    Logger.Error($"OlyCameraNative: {sigError}");
+                    return false;
                 }
 
                 int hr = Raw_OlyCamLib_Initialize("OM Workspace");
@@ -184,16 +330,6 @@ namespace NINA.Plugin.OMCamera.Native
                     Logger.Error($"OlyCameraNative: OlyCamLib_Initialize failed with hr=0x{hr:X}");
                     return false;
                 }
-
-                try
-                {
-                    IntPtr hMod = GetModuleHandle("OlyCameraLib.dll");
-                    if (hMod != IntPtr.Zero)
-                    {
-                        Marshal.WriteInt32(hMod + 0x72568, 4);
-                    }
-                }
-                catch { }
 
                 hr = Raw_OlyCamLib_GetManagerInstance(out _pManager);
                 if (hr != 0 || _pManager == IntPtr.Zero)
@@ -204,19 +340,27 @@ namespace NINA.Plugin.OMCamera.Native
 
                 try
                 {
-                    // CRITICAL FIX: COlyCameraCtrlManager constructor (0x34ad0) leaves byte +0x80 (m_bUseLocModelWhitelist)
-                    // uninitialized on the heap when the 'locmodel' registry key is absent. If the heap byte happens to be 1,
-                    // sub_180038300 checks an empty model whitelist and rejects all cameras in ScanCameras!
-                    // Explicitly zero byte +0x80 so all OM System / Olympus cameras are always accepted.
+                    // Why clearing byte +0x80 on COlyCameraCtrlManager is required on OlyCameraLib.dll 1.1.0.49 (SDK 2.1.0):
+                    // 1. During OlyCamLib_Initialize (RVA 0x481A0 -> sub_1800493B0), the library inspects GetModuleFileNameW(NULL)
+                    //    against "OM Workspace.exe" (RVA 0x60668). When hosted in NINA.exe, sub_1800493B0 returns 0x80041004 and
+                    //    leaves the global flag at RVA 0x767D6 set to 0.
+                    // 2. OlyCamLib_CreateInstance (RVA 0x33737) allocates the 0xC0-byte COlyCameraCtrlManager via operator new(0xC0)
+                    //    (unzeroed heap memory) and runs its constructor (RVA 0x356D0). When RVA 0x767D6 != 1 (or when 'locmodel'
+                    //    is not parsed at RVA 0x35A4F), the constructor omits initializing BYTE PTR [this + 0x80] (m_bHasLocModel).
+                    // 3. During ScanCameras, COlyCameraCtrlManager::IsModelSupported (RVA 0x38300) executes
+                    //    'cmp BYTE PTR [rcx + 0x80], 0x1' (RVA 0x3833D) and, if equal to 1, filters cameras against the empty map
+                    //    at [rcx + 0x70], rejecting all cameras.
+                    // Having verified both the exact library version (1.1.0.49 / 2.1.0) and the instruction opcodes at RVA 0x35A4F
+                    // and RVA 0x3833D above, we deterministically initialize byte +0x80 to 0.
                     byte oldLocFlag = Marshal.ReadByte(_pManager, 0x80);
                     Marshal.WriteByte(_pManager, 0x80, 0);
-                    IntPtr pidBegin = Marshal.ReadIntPtr(_pManager, 0x28);
-                    IntPtr pidEnd = Marshal.ReadIntPtr(_pManager, 0x30);
-                    long pidCount = (pidEnd.ToInt64() - pidBegin.ToInt64()) / 4;
-                    byte locFlag = Marshal.ReadByte(_pManager, 0x80);
-                    Logger.Info($"OlyCameraNative: Initialized pMgr=0x{_pManager.ToInt64():X}, pidCount={pidCount}, locmodelFlag={locFlag} (was {oldLocFlag})");
+                    Logger.Info($"OlyCameraNative: Initialized verified OlyCameraLib.dll (SDK {apiMaj}.{apiMin}.{apiBld}, File {fvi.FileMajorPart}.{fvi.FileMinorPart}.{fvi.FileBuildPart}.{fvi.FilePrivatePart}), pMgr=0x{_pManager.ToInt64():X}, locmodelFlag=0 (was {oldLocFlag})");
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Logger.Error($"OlyCameraNative: Failed to initialize COlyCameraCtrlManager state: {ex.Message}");
+                    return false;
+                }
 
                 _isInitialized = true;
                 return true;

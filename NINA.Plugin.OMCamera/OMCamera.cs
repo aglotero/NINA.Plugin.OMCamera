@@ -69,10 +69,10 @@ namespace NINA.Plugin.OMCamera
             DisplayName = "OM System / Olympus Camera (Native REA)";
             Description = "Direct high-speed camera capture driver for OM System / Olympus cameras via OlyCameraLib.";
 
-            BinningModes = new AsyncObservableCollection<BinningMode>
+            BinningModes = new AsyncObservableCollection<BinningMode>(new[]
             {
                 new BinningMode(1, 1)
-            };
+            });
         }
 
         #region IDevice Implementation
@@ -82,8 +82,8 @@ namespace NINA.Plugin.OMCamera
         public string DisplayName { get; private set; }
         public string Category => "Camera";
         public string Description { get; }
-        public string DriverInfo => "OM System Native REA Driver v1.1";
-        public string DriverVersion => "1.1.0";
+        public string DriverInfo => "OM System Native REA Driver v1.2";
+        public string DriverVersion => "1.2.0";
         public bool HasSetupDialog => false;
         public IList<string> SupportedActions => new List<string>();
 
@@ -881,126 +881,77 @@ namespace NINA.Plugin.OMCamera
             return meta;
         }
 
-        private async Task<IExposureData> CreateExposureDataFromBytes(byte[] rawBytes, ImageMetaData meta, CancellationToken token)
+        internal Func<RawConverterEnum, byte[], ImageMetaData, CancellationToken, Task<IImageData?>>? RawDecoderOverride { get; set; }
+
+        internal async Task<IExposureData> CreateExposureDataFromBytes(byte[] rawBytes, ImageMetaData meta, CancellationToken token)
         {
-            // Case 1: Direct JPEG file (0xFF 0xD8)
-            if (rawBytes.Length > 2 && rawBytes[0] == 0xFF && rawBytes[1] == 0xD8)
+            // Enforce that still/calibration exposures only accept valid .ORF RAW files (never JPEG previews or raw file bytes).
+            OrfRawProcessor.ValidateOrfBuffer(rawBytes);
+
+            if (_exposureDataFactory == null)
             {
-                Logger.Info($"OMCamera: Decoding captured JPEG ({rawBytes.Length} bytes).");
-                return await DecodeBitmapExposureData(rawBytes, meta);
+                throw new InvalidOperationException("Unable to decode RAW exposure: IExposureDataFactory is unavailable.");
             }
 
-            // Case 2: Olympus RAW (.ORF) file ("II" header)
-            if (_exposureDataFactory != null)
-            {
-                // Always patch the Make/Model header in memory so NINA's bundled FreeImage 3.19.0 (LibRaw)
-                // recognizes the OM System camera as Olympus and decompresses the 12-bit ORF lossless stream
-                // instead of misreading the compressed strip as uncompressed TIFF bytes.
-                byte[] patchedOrf = PatchOrfHeaderForLegacyLibRaw(rawBytes);
+            int sensorBitDepth = OrfRawProcessor.GetDefinedSensorBitDepth(rawBytes);
+            byte[] patchedOrf = OrfRawProcessor.PatchOrfHeaderForLegacyLibRaw(rawBytes);
+            Exception? lastException = null;
 
-                foreach (var converter in new[] { RawConverterEnum.FREEIMAGE, RawConverterEnum.DCRAW })
+            foreach (var converter in new[] { RawConverterEnum.FREEIMAGE, RawConverterEnum.DCRAW })
+            {
+                try
                 {
-                    try
+                    Logger.Info($"OMCamera: Decoding {sensorBitDepth}-bit ORF RAW ({patchedOrf.Length} bytes) via {converter}...");
+                    IImageData? imgData;
+                    if (RawDecoderOverride != null)
                     {
-                        Logger.Info($"OMCamera: Decoding 12-bit ORF RAW ({patchedOrf.Length} bytes) via {converter}...");
-                        var rawExp = _exposureDataFactory.CreateRAWExposureData(converter, patchedOrf, "orf", 16, meta);
-                        var imgData = await rawExp.ToImageData(null, token);
-                        if (imgData != null && imgData.Properties.Width > 0)
+                        imgData = await RawDecoderOverride(converter, patchedOrf, meta, token);
+                    }
+                    else
+                    {
+                        var rawExp = _exposureDataFactory.CreateRAWExposureData(converter, patchedOrf, "orf", OrfRawProcessor.OutputBitDepth, meta);
+                        if (rawExp == null)
                         {
-                            if (_cameraXSize != imgData.Properties.Width || _cameraYSize != imgData.Properties.Height)
-                            {
-                                _cameraXSize = imgData.Properties.Width;
-                                _cameraYSize = imgData.Properties.Height;
-                                RaisePropertyChanged(nameof(CameraXSize));
-                                RaisePropertyChanged(nameof(CameraYSize));
-                            }
-                            ushort[]? flat = imgData.Data?.FlatArray;
-                            if (flat != null && flat.Length > 0)
-                            {
-                                // Check if FreeImage decoded 12-bit ORF sensor values (0..4095) into the lower 12 bits of 16-bit ushort
-                                ushort maxVal = 0;
-                                int step = Math.Max(1, flat.Length / 10000);
-                                for (int i = 0; i < flat.Length; i += step)
-                                {
-                                    if (flat[i] > maxVal) maxVal = flat[i];
-                                }
-
-                                if (maxVal > 0 && maxVal <= 4095)
-                                {
-                                    ushort[] scaled = new ushort[flat.Length];
-                                    for (int i = 0; i < flat.Length; i++)
-                                    {
-                                        scaled[i] = (ushort)(flat[i] << 4);
-                                    }
-                                    Logger.Info($"OMCamera: Successfully decoded 12-bit ORF RAW with {converter} ({imgData.Properties.Width}x{imgData.Properties.Height}) and scaled 12-bit ADU (<< 4) to 16-bit range.");
-                                    return _exposureDataFactory.CreateImageArrayExposureData(scaled, imgData.Properties.Width, imgData.Properties.Height, 16, true, meta);
-                                }
-                            }
-
-                            Logger.Info($"OMCamera: Successfully decoded ORF RAW with {converter} ({imgData.Properties.Width}x{imgData.Properties.Height}).");
-                            return _exposureDataFactory.CreateCachedExposureData(imgData);
+                            continue;
                         }
+                        imgData = await rawExp.ToImageData(null, token);
                     }
-                    catch (Exception ex)
+
+                    ushort[]? flat = imgData?.Data?.FlatArray;
+                    int width = imgData?.Properties?.Width ?? 0;
+                    int height = imgData?.Properties?.Height ?? 0;
+
+                    if (imgData != null && width > 0 && height > 0 && flat != null && flat.Length == width * height)
                     {
-                        Logger.Warning($"OMCamera: RAW converter {converter} failed on ORF: {ex.Message}");
+                        if (_cameraXSize != width || _cameraYSize != height)
+                        {
+                            _cameraXSize = width;
+                            _cameraYSize = height;
+                            RaisePropertyChanged(nameof(CameraXSize));
+                            RaisePropertyChanged(nameof(CameraYSize));
+                        }
+
+                        // Deterministically scale from the decoder's defined linear sensor range (e.g. 12-bit 0..4095 -> 16-bit 0..65520)
+                        // without sampling image brightness, so bias, darks, flats, and lights receive identical scaling.
+                        ushort[] scaled = OrfRawProcessor.ScaleDecodedRawPixelsTo16Bit(flat, sensorBitDepth);
+                        Logger.Info($"OMCamera: Successfully decoded {sensorBitDepth}-bit ORF RAW with {converter} ({width}x{height}) and scaled deterministically (<< {OrfRawProcessor.OutputBitDepth - sensorBitDepth}) to 16-bit range.");
+                        return _exposureDataFactory.CreateImageArrayExposureData(scaled, width, height, OrfRawProcessor.OutputBitDepth, true, meta);
                     }
                 }
-            }
-
-            // Fallback: Extract largest embedded JPEG preview stream from the ORF file
-            byte[]? embeddedJpeg = ExtractLargestEmbeddedJpeg(rawBytes);
-            if (embeddedJpeg != null && embeddedJpeg.Length > 0)
-            {
-                Logger.Info($"OMCamera: Extracted embedded JPEG ({embeddedJpeg.Length} bytes) from ORF for display.");
-                return await DecodeBitmapExposureData(embeddedJpeg, meta);
-            }
-
-            // Final fallback: raw ushort array via _exposureDataFactory
-            ushort[] pixels = DecodeOrfPixelsFallback(rawBytes, CameraXSize, CameraYSize);
-            if (_exposureDataFactory != null)
-            {
-                return _exposureDataFactory.CreateImageArrayExposureData(pixels, CameraXSize, CameraYSize, BitDepth, true, meta);
-            }
-            throw new InvalidOperationException("Unable to decode image buffer: IExposureDataFactory is unavailable.");
-        }
-
-        private static byte[] PatchOrfHeaderForLegacyLibRaw(byte[] orfBytes)
-        {
-            // NINA 3.2 bundles FreeImage 3.19.0 whose internal LibRaw table knows "OLYMPUS CORPORATION" / "E-M1MarkII"
-            // but predates the "OM Digital Solutions" / "OM-1MarkII" rebrand (exact same 20-byte & 10-byte lengths).
-            byte[] copy = (byte[])orfBytes.Clone();
-            int scanLimit = Math.Min(copy.Length, 16384);
-            ReplaceAsciiInPlace(copy, scanLimit, "OM Digital Solutions", "OLYMPUS CORPORATION ");
-            ReplaceAsciiInPlace(copy, scanLimit, "OM-1MarkII", "E-M1MarkII");
-            ReplaceAsciiInPlace(copy, scanLimit, "OM-5MarkII", "E-M5MarkII");
-            ReplaceAsciiInPlace(copy, scanLimit, "OM-1      ", "E-M1MarkII");
-            ReplaceAsciiInPlace(copy, scanLimit, "OM-5      ", "E-M5MarkII");
-            ReplaceAsciiInPlace(copy, scanLimit, "OM-3      ", "E-M1MarkII");
-            return copy;
-        }
-
-        private static void ReplaceAsciiInPlace(byte[] buf, int limit, string target, string replacement)
-        {
-            if (target.Length != replacement.Length) return;
-            byte[] tBytes = Encoding.ASCII.GetBytes(target);
-            byte[] rBytes = Encoding.ASCII.GetBytes(replacement);
-            for (int i = 0; i <= limit - tBytes.Length; i++)
-            {
-                bool match = true;
-                for (int j = 0; j < tBytes.Length; j++)
+                catch (OperationCanceledException)
                 {
-                    if (buf[i + j] != tBytes[j])
-                    {
-                        match = false;
-                        break;
-                    }
+                    throw;
                 }
-                if (match)
+                catch (Exception ex)
                 {
-                    Buffer.BlockCopy(rBytes, 0, buf, i, rBytes.Length);
+                    lastException = ex;
+                    Logger.Warning($"OMCamera: RAW converter {converter} failed on ORF: {ex.Message}");
                 }
             }
+
+            throw new InvalidOperationException(
+                "Camera exposure failed: RAW converters (FreeImage / DCRaw) could not decode valid pixel data from the .ORF buffer.",
+                lastException);
         }
 
         private async Task<IExposureData> DecodeBitmapExposureData(byte[] imageBytes, ImageMetaData meta)
@@ -1037,7 +988,7 @@ namespace NINA.Plugin.OMCamera
                             rowByteIdx += 3;
 
                             // Encode 8-bit RGB into a 16-bit RGGB Bayer pattern (0..65535) + tiny sub-LSB dither (0..15)
-                            // so NINA's Debayer pipeline renders full-color LiveView and JPEG frames without MAD=0.00 collapse
+                            // so NINA's Debayer pipeline renders full-color LiveView frames without MAD=0.00 collapse
                             int channelVal = evenRow
                                 ? (((x & 1) == 0) ? r : g)
                                 : (((x & 1) == 0) ? g : b);
@@ -1059,62 +1010,6 @@ namespace NINA.Plugin.OMCamera
             }
 
             throw new InvalidOperationException("IExposureDataFactory is not initialized.");
-        }
-
-        private static byte[]? ExtractLargestEmbeddedJpeg(byte[] orfBytes)
-        {
-            int bestStart = -1;
-            int bestLen = 0;
-
-            for (int i = 0; i < orfBytes.Length - 4; i++)
-            {
-                if (orfBytes[i] == 0xFF && orfBytes[i + 1] == 0xD8 && orfBytes[i + 2] == 0xFF &&
-                    (orfBytes[i + 3] == 0xDB || orfBytes[i + 3] == 0xE0 || orfBytes[i + 3] == 0xE1))
-                {
-                    // Search forward for EOI (FF D9) after at least 32 KB
-                    for (int j = i + 4; j < orfBytes.Length - 1; j++)
-                    {
-                        if (orfBytes[j] == 0xFF && orfBytes[j + 1] == 0xD9)
-                        {
-                            int len = (j + 2) - i;
-                            if (len > bestLen)
-                            {
-                                bestStart = i;
-                                bestLen = len;
-                            }
-                            if (len > 500_000)
-                            {
-                                // Found full-resolution embedded preview JPEG!
-                                byte[] jpeg = new byte[len];
-                                Buffer.BlockCopy(orfBytes, i, jpeg, 0, len);
-                                return jpeg;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (bestStart >= 0 && bestLen > 1024)
-            {
-                byte[] jpeg = new byte[bestLen];
-                Buffer.BlockCopy(orfBytes, bestStart, jpeg, 0, bestLen);
-                return jpeg;
-            }
-            return null;
-        }
-
-        private static ushort[] DecodeOrfPixelsFallback(byte[] orfBytes, int width, int height)
-        {
-            int total = width * height;
-            ushort[] buffer = new ushort[total];
-
-            int offset = Math.Max(0, orfBytes.Length - total * sizeof(ushort));
-            int copyBytes = Math.Min(total * sizeof(ushort), orfBytes.Length - offset);
-            if (copyBytes > 0)
-            {
-                Buffer.BlockCopy(orfBytes, offset, buffer, 0, copyBytes);
-            }
-            return buffer;
         }
 
         #endregion

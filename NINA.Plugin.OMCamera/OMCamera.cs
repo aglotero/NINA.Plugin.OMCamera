@@ -1028,6 +1028,7 @@ namespace NINA.Plugin.OMCamera
                     {
                         int rowByteIdx = y * stride;
                         int rowPixIdx = y * w;
+                        bool evenRow = (y & 1) == 0;
                         for (int x = 0; x < w; x++)
                         {
                             int b = rgbBytes[rowByteIdx];
@@ -1035,15 +1036,21 @@ namespace NINA.Plugin.OMCamera
                             int r = rgbBytes[rowByteIdx + 2];
                             rowByteIdx += 3;
 
-                            // Full-precision 16-bit BT.601 luminance (0..65280) + tiny sub-LSB dither (0..15)
-                            // so flat 8-bit JPEG macroblocks never collapse to MAD=0.00 under NINA Auto-Stretch
-                            int luma = (29 * b + 150 * g + 77 * r) + ((x * 7 + y * 13) & 0x0F);
-                            pixels[rowPixIdx + x] = (ushort)(luma > 65535 ? 65535 : luma);
+                            // Encode 8-bit RGB into a 16-bit RGGB Bayer pattern (0..65535) + tiny sub-LSB dither (0..15)
+                            // so NINA's Debayer pipeline renders full-color LiveView and JPEG frames without MAD=0.00 collapse
+                            int channelVal = evenRow
+                                ? (((x & 1) == 0) ? r : g)
+                                : (((x & 1) == 0) ? g : b);
+
+                            int scaled = (channelVal * 257) + ((x * 7 + y * 13) & 0x0F);
+                            pixels[rowPixIdx + x] = (ushort)(scaled > 65535 ? 65535 : scaled);
                         }
                     }
 
-                    meta.Camera.SensorType = SensorType.Monochrome;
-                    return _exposureDataFactory.CreateImageArrayExposureData(pixels, w, h, 16, false, meta);
+                    meta.Camera.SensorType = SensorType.RGGB;
+                    meta.Camera.BayerOffsetX = 0;
+                    meta.Camera.BayerOffsetY = 0;
+                    return _exposureDataFactory.CreateImageArrayExposureData(pixels, w, h, 16, true, meta);
                 }
                 catch
                 {

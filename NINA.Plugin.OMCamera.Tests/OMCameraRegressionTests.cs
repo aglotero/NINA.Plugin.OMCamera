@@ -270,6 +270,69 @@ namespace NINA.Plugin.OMCamera.Tests
             }
         }
 
+        [Fact]
+        public void TryComputeFocusCommand_MapsDirectionAndPulseCountDeterministically()
+        {
+            Assert.False(OMCameraDevice.TryComputeFocusCommand(0, out uint dirZero, out uint countZero));
+            Assert.Equal(0u, dirZero);
+            Assert.Equal(0u, countZero);
+
+            Assert.True(OMCameraDevice.TryComputeFocusCommand(-150, out uint dirNear, out uint countNear));
+            Assert.Equal(OlyCameraNative.FOCUS_DIRECTION_NEAR, dirNear);
+            Assert.Equal(150u, countNear);
+
+            Assert.True(OMCameraDevice.TryComputeFocusCommand(275, out uint dirFar, out uint countFar));
+            Assert.Equal(OlyCameraNative.FOCUS_DIRECTION_FAR, dirFar);
+            Assert.Equal(275u, countFar);
+        }
+
+        [Fact]
+        public async Task OMFocuser_MoveAndHalt_TranslatesAbsolutePositionsIntoRelativePulseSteps()
+        {
+            var recordedPulses = new System.Collections.Generic.List<int>();
+            bool haltCalled = false;
+
+            var focuser = new OMFocuser(
+                stepDelta =>
+                {
+                    recordedPulses.Add(stepDelta);
+                    return true;
+                },
+                () => haltCalled = true,
+                initialPosition: 50000);
+
+            Assert.True(await focuser.Connect(CancellationToken.None));
+            Assert.True(focuser.Connected);
+            Assert.Equal(50000, focuser.Position);
+
+            // 1. Move outward by +250 steps
+            await focuser.Move(50250, CancellationToken.None, waitInMs: 0);
+            Assert.Equal(50250, focuser.Position);
+            Assert.Equal(new[] { 250 }, recordedPulses);
+
+            // 2. Move inward by -350 steps (50250 -> 49900)
+            recordedPulses.Clear();
+            await focuser.Move(49900, CancellationToken.None, waitInMs: 0);
+            Assert.Equal(49900, focuser.Position);
+            Assert.Equal(new[] { -350 }, recordedPulses);
+
+            // 3. Large move (+2300 steps: 49900 -> 52200) chunks into MaxPulsesPerNativeCall (1000, 1000, 300)
+            recordedPulses.Clear();
+            await focuser.Move(52200, CancellationToken.None, waitInMs: 0);
+            Assert.Equal(52200, focuser.Position);
+            Assert.Equal(new[] { 1000, 1000, 300 }, recordedPulses);
+
+            // 4. ResetPosition action updates virtual position without driving lens
+            string resetRes = focuser.Action("ResetPosition", "25000");
+            Assert.Equal("25000", resetRes);
+            Assert.Equal(25000, focuser.Position);
+
+            // 5. Halt invokes native halt handler and clears IsMoving
+            focuser.Halt();
+            Assert.True(haltCalled);
+            Assert.False(focuser.IsMoving);
+        }
+
         private static byte[] BuildMinimalOrfHeaderWithEmbeddedJpeg(ushort validBits)
         {
             byte[] buf = new byte[512];

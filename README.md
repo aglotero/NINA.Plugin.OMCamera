@@ -15,8 +15,11 @@ A native 64-bit camera driver plugin for **[N.I.N.A. (Nighttime Imaging 'N' Astr
   - Supports arbitrary long exposures when the camera is set to **Bulb** mode.
 - **Bidirectional Camera Synchronization:**
   - **ISO (`Gain`):** Dynamically queries the camera's exact supported ISO values (`80` to `102400` in 1/3-stop increments on OM-1 Mark II) and syncs changes in both directions between N.I.N.A. and the physical camera dial.
-  - **Shutter Speed (`Exposure Time`):** Converts requested exposure durations to the closest supported camera fraction (`numerator / denominator`).
+  - **Shutter Speed (`Exposure Time`):** Converts requested exposure durations to the closest supported camera fraction (`numerator / denominator`) and synchronizes exposure duration changes bidirectionally across the camera dial, N.I.N.A.'s **Imaging** panel, and **AutoFocus** settings (`FocuserSettings.AutoFocusExposureTime`).
   - **Lens Aperture (`Readout Mode` & Imaging Screen Dropdown):** Queries the attached Micro Four Thirds lens's supported f-stops (`f/1.2` – `f/22`), exposes an **Aperture** selector directly inside N.I.N.A.'s **Imaging** panel (below **Gain**) as well as the Camera **Readout Mode** dropdown, and stays synchronized with the camera dial.
+- **Electronic Lens Focus Control (`IFocuser` Driver & AutoFocus):**
+  - Exposes **OM System / Olympus Lens Focuser** under **Equipment -> Focuser**, sharing the active USB tether session with the camera driver.
+  - Drives electronic Micro Four Thirds lens focus motors via `IOlyCamera::SetFocusAdjustPulse` (with automatic AF-lock recovery and `SetFocusAdjust` fallback), enabling both manual focus stepping (`<<`, `<`, `>`, `>>`) and automated **HFR / Contrast AutoFocus** routines in N.I.N.A.
 - **LiveView Streaming:** Supports real-time LiveView framing and focusing directly inside N.I.N.A.
 
 ---

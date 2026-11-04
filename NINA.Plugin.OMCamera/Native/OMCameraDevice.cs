@@ -198,9 +198,21 @@ namespace NINA.Plugin.OMCamera.Native
         [return: MarshalAs(UnmanagedType.I1)]
         private delegate bool IsTakingPictureDelegate(IntPtr pThis);
 
-        // Slot 58: SetFocusAdjustPulse
+        // Slot 57: SetFocusAdjust(this, uint direction, uint step) — RVA 0x0F960
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        private delegate int SetFocusAdjustPulseDelegate(IntPtr pThis, int pulseStep, int reserved);
+        private delegate int SetFocusAdjustDelegate(IntPtr pThis, uint direction, uint step);
+
+        // Slot 58: SetFocusAdjustPulse(this, uint direction, uint pulseCount) — RVA 0x0FC40
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int SetFocusAdjustPulseDelegate(IntPtr pThis, uint direction, uint pulseCount);
+
+        // Slot 59: LockAutoFocus(this) — RVA 0x0FF20
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int LockAutoFocusDelegate(IntPtr pThis);
+
+        // Slot 60: UnlockAutoFocus(this) — RVA 0x100F0
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int UnlockAutoFocusDelegate(IntPtr pThis);
 
         // Slot 105: DownloadLastCapturedImage (fallback for standalone mode)
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
@@ -209,6 +221,104 @@ namespace NINA.Plugin.OMCamera.Native
         // IUnknown Release (Slot 2)
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         private delegate uint ReleaseDelegate(IntPtr pThis);
+
+        private static readonly object _sharedSessionLock = new object();
+        private static OMCameraDevice? _sharedDevice;
+        private static int _sharedRefCount = 0;
+
+        public static OMCameraDevice? ActiveSharedDevice
+        {
+            get
+            {
+                lock (_sharedSessionLock)
+                {
+                    return _sharedDevice;
+                }
+            }
+        }
+
+        public static OMCameraDevice? AcquireSharedSession()
+        {
+            lock (_sharedSessionLock)
+            {
+                if (_sharedDevice != null && _sharedDevice.IsConnected())
+                {
+                    _sharedRefCount++;
+                    Logger.Info($"OMCameraDevice: Reusing active shared camera session (clients={_sharedRefCount}).");
+                    return _sharedDevice;
+                }
+
+                if (_sharedDevice != null)
+                {
+                    try { _sharedDevice.Dispose(); } catch { }
+                    _sharedDevice = null;
+                    _sharedRefCount = 0;
+                }
+
+                if (!OlyCameraNative.EnsureInitialized())
+                {
+                    Logger.Error("OMCameraDevice: Failed to initialize OlyCameraLib native backend.");
+                    return null;
+                }
+
+                uint count = OlyCameraNative.GetDetectedCameraCount();
+                Logger.Info($"OMCameraDevice: Scanning for cameras... Found {count} connected camera(s).");
+
+                if (count == 0)
+                {
+                    Thread.Sleep(300);
+                    count = OlyCameraNative.GetDetectedCameraCount();
+                    Logger.Info($"OMCameraDevice: Retry scanning for cameras... Found {count} connected camera(s).");
+                }
+
+                IntPtr pCam = OlyCameraNative.GetCameraInstance(0);
+                if (pCam == IntPtr.Zero)
+                {
+                    Logger.Warning("OMCameraDevice: No camera instance available at index 0. Ensure camera is powered on and in PC / Tether mode.");
+                    return null;
+                }
+
+                var dev = new OMCameraDevice(pCam);
+                if (dev.Connect())
+                {
+                    _sharedDevice = dev;
+                    _sharedRefCount = 1;
+                    Logger.Info("OMCameraDevice: Opened new shared camera session (clients=1).");
+                    return dev;
+                }
+
+                dev.Dispose();
+                return null;
+            }
+        }
+
+        public static void ReleaseSharedSession(OMCameraDevice? device)
+        {
+            if (device == null) return;
+            lock (_sharedSessionLock)
+            {
+                if (ReferenceEquals(device, _sharedDevice))
+                {
+                    _sharedRefCount = Math.Max(0, _sharedRefCount - 1);
+                    if (_sharedRefCount == 0)
+                    {
+                        Logger.Info("OMCameraDevice: Last client disconnected; closing shared camera session.");
+                        try { _sharedDevice.Disconnect(); } catch { }
+                        try { _sharedDevice.Dispose(); } catch { }
+                        _sharedDevice = null;
+                    }
+                    else
+                    {
+                        Logger.Info($"OMCameraDevice: Client disconnected; keeping shared camera session open for remaining client(s) (clients={_sharedRefCount}).");
+                    }
+                }
+                else
+                {
+                    try { device.Disconnect(); } catch { }
+                    try { device.Dispose(); } catch { }
+                }
+            }
+        }
 
         public OMCameraDevice(IntPtr pCamera)
         {
@@ -1278,16 +1388,101 @@ namespace NINA.Plugin.OMCamera.Native
             return null;
         }
 
-        public bool SetFocusStep(int pulseStep)
+        /// <summary>
+        /// Maps a signed focus step delta into the native IOlyCamera::SetFocusAdjustPulse / SetFocusAdjust
+        /// (direction, pulseCount) parameters verified at RVA 0x0FC40 / RVA 0x0F960 in OlyCameraLib.dll:
+        /// - pulseStep &lt; 0: direction = 1 (FOCUS_DIRECTION_NEAR / Close / In), pulseCount = |pulseStep|
+        /// - pulseStep &gt; 0: direction = 2 (FOCUS_DIRECTION_FAR / Infinity / Out), pulseCount = |pulseStep|
+        /// </summary>
+        public static bool TryComputeFocusCommand(int pulseStep, out uint direction, out uint pulseCount)
         {
+            if (pulseStep == 0)
+            {
+                direction = 0;
+                pulseCount = 0;
+                return false;
+            }
+
+            direction = pulseStep > 0
+                ? OlyCameraNative.FOCUS_DIRECTION_FAR
+                : OlyCameraNative.FOCUS_DIRECTION_NEAR;
+            pulseCount = (uint)Math.Abs((long)pulseStep);
+            return true;
+        }
+
+        public bool UnlockAutoFocus()
+        {
+            if (_pCamera == IntPtr.Zero) return false;
             try
             {
-                var focusFunc = GetMethod<SetFocusAdjustPulseDelegate>(58);
-                int hr = focusFunc(_pCamera, pulseStep, 0);
+                var unlockFunc = GetMethod<UnlockAutoFocusDelegate>(60);
+                int hr = unlockFunc(_pCamera);
+                Logger.Info($"OMCameraDevice: UnlockAutoFocus (Slot 60) hr=0x{hr:X}");
                 return hr == 0;
             }
-            catch
+            catch (Exception ex)
             {
+                Logger.Warning($"OMCameraDevice: UnlockAutoFocus error: {ex.Message}");
+                return false;
+            }
+        }
+
+        public bool HaltFocus()
+        {
+            if (_pCamera == IntPtr.Zero) return false;
+            try
+            {
+                var focusPulseFunc = GetMethod<SetFocusAdjustPulseDelegate>(58);
+                int hr = focusPulseFunc(_pCamera, OlyCameraNative.FOCUS_DIRECTION_STOP, 0);
+                Logger.Info($"OMCameraDevice: HaltFocus via SetFocusAdjustPulse(STOP=3, 0) hr=0x{hr:X}");
+                return hr == 0;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"OMCameraDevice: HaltFocus error: {ex.Message}");
+                return false;
+            }
+        }
+
+        public bool SetFocusStep(int pulseStep)
+        {
+            if (_pCamera == IntPtr.Zero) return false;
+            if (!TryComputeFocusCommand(pulseStep, out uint direction, out uint pulseCount))
+                return true;
+
+            try
+            {
+                var focusPulseFunc = GetMethod<SetFocusAdjustPulseDelegate>(58);
+                int hr = focusPulseFunc(_pCamera, direction, pulseCount);
+
+                // If the camera reports 0x80048116 ("Error >> Camera is in auto-focus.", [this+0x43F]==1),
+                // release the AF lock via Slot 60 (UnlockAutoFocus) and retry once.
+                if (hr == OlyCameraNative.OLY_ERR_IN_AUTOFOCUS)
+                {
+                    Logger.Info("OMCameraDevice: SetFocusAdjustPulse returned 0x80048116 (camera in AF lock); calling UnlockAutoFocus and retrying.");
+                    UnlockAutoFocus();
+                    hr = focusPulseFunc(_pCamera, direction, pulseCount);
+                }
+
+                // If SetFocusAdjustPulse (PTP 0x94B7 / SDK_CMD 0x1D) is not supported by the attached body/lens,
+                // fall back to Slot 57 SetFocusAdjust (PTP 0x9487 / SDK_CMD 0x07).
+                if (hr == OlyCameraNative.OLY_ERR_NOT_SUPPORTED)
+                {
+                    var focusAdjustFunc = GetMethod<SetFocusAdjustDelegate>(57);
+                    uint coarseStep = Math.Clamp(pulseCount, 1u, 3u);
+                    hr = focusAdjustFunc(_pCamera, direction, coarseStep);
+                    Logger.Info($"OMCameraDevice: Fallback SetFocusAdjust(dir={direction}, step={coarseStep}) hr=0x{hr:X}");
+                }
+                else
+                {
+                    Logger.Info($"OMCameraDevice: SetFocusAdjustPulse(dir={direction}, pulses={pulseCount}) hr=0x{hr:X}");
+                }
+
+                return hr == 0;
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"OMCameraDevice: SetFocusStep({pulseStep}) exception: {ex.Message}");
                 return false;
             }
         }

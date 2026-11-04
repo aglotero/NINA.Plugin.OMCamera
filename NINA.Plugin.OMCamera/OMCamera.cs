@@ -50,6 +50,8 @@ namespace NINA.Plugin.OMCamera
         private short _readoutMode = 0;
         private bool _hasDynamicLensApertures = false;
         private long _lastPropertyPollTicks = 0;
+        private double _lastSyncedExposureTime = -1.0;
+        private object? _snapshotVmRef;
         private bool _liveViewEnabled = false;
         private int _cameraXSize = 5220;
         private int _cameraYSize = 3912;
@@ -105,6 +107,7 @@ namespace NINA.Plugin.OMCamera
                             RaisePropertyChanged(nameof(Gain));
                         }
                         PollApertureFromCamera();
+                        PollAndSyncExposureTime();
                         EnsureImagingPanelApertureControl();
                     }
                 }
@@ -118,31 +121,13 @@ namespace NINA.Plugin.OMCamera
             {
                 try
                 {
-                    if (!OlyCameraNative.EnsureInitialized())
+                    if (_device != null && _device.IsConnected())
                     {
-                        Logger.Error("OMCamera: Failed to initialize OlyCameraLib native backend.");
-                        return false;
+                        return true;
                     }
 
-                    uint count = OlyCameraNative.GetDetectedCameraCount();
-                    Logger.Info($"OMCamera: Scanning for cameras... Found {count} connected camera(s).");
-
-                    if (count == 0)
-                    {
-                        Thread.Sleep(300);
-                        count = OlyCameraNative.GetDetectedCameraCount();
-                        Logger.Info($"OMCamera: Retry scanning for cameras... Found {count} connected camera(s).");
-                    }
-
-                    IntPtr pCam = OlyCameraNative.GetCameraInstance(0);
-                    if (pCam == IntPtr.Zero)
-                    {
-                        Logger.Warning("OMCamera: No camera instance available at index 0. Ensure camera is powered on and in PC / Tether mode.");
-                        return false;
-                    }
-
-                    _device = new OMCameraDevice(pCam);
-                    if (_device.Connect())
+                    _device = OMCameraDevice.AcquireSharedSession();
+                    if (_device != null && _device.IsConnected())
                     {
                         string model = _device.GetModelName();
                         string sn = _device.GetSerialNumber();
@@ -175,6 +160,10 @@ namespace NINA.Plugin.OMCamera
                         }
 
                         double currentShutter = _device.GetShutterSpeed();
+                        if (currentShutter > 0)
+                        {
+                            ApplySyncedExposureTime(currentShutter, updateUiAndProfile: true);
+                        }
                         string currentApertureLabel = (_readoutMode >= 0 && _readoutMode < _readoutModes.Count) ? _readoutModes[_readoutMode] : "f/--";
                         Logger.Info($"OMCamera: Connected to {model} (S/N: {sn}) in PC Capture mode (ISO={_gain}, Shutter={currentShutter:F4}s, Aperture={currentApertureLabel}, SupportedISOs={_gains.Count}, SupportedApertures={_readoutModes.Count}).");
                         CameraState = CameraStates.Idle;
@@ -211,7 +200,6 @@ namespace NINA.Plugin.OMCamera
                     else
                     {
                         Logger.Error("OMCamera: Failed to establish camera session.");
-                        _device.Dispose();
                         _device = null;
                         return false;
                     }
@@ -230,9 +218,9 @@ namespace NINA.Plugin.OMCamera
             {
                 if (_device != null)
                 {
-                    _device.Disconnect();
-                    _device.Dispose();
+                    var dev = _device;
                     _device = null;
+                    OMCameraDevice.ReleaseSharedSession(dev);
                 }
             }
             finally
@@ -480,6 +468,109 @@ namespace NINA.Plugin.OMCamera
             }
         }
 
+        private void ApplySyncedExposureTime(double exposureSeconds, bool updateUiAndProfile)
+        {
+            if (exposureSeconds <= 0) return;
+
+            _exposureDuration = exposureSeconds;
+            _lastSyncedExposureTime = exposureSeconds;
+
+            if (updateUiAndProfile)
+            {
+                try
+                {
+                    var activeProfile = _profileService?.ActiveProfile;
+                    if (activeProfile?.FocuserSettings != null)
+                    {
+                        activeProfile.FocuserSettings.AutoFocusExposureTime = exposureSeconds;
+                    }
+                    if (activeProfile?.SnapShotControlSettings != null)
+                    {
+                        activeProfile.SnapShotControlSettings.ExposureDuration = exposureSeconds;
+                    }
+                }
+                catch { }
+
+                UpdateSnapshotVmExposureOnDispatcher(exposureSeconds);
+            }
+        }
+
+        private void UpdateSnapshotVmExposureOnDispatcher(double exposureSeconds)
+        {
+            var vm = _snapshotVmRef;
+            if (vm == null) return;
+
+            try
+            {
+                var app = Application.Current;
+                if (app?.Dispatcher == null) return;
+
+                app.Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    try
+                    {
+                        var prop = vm.GetType().GetProperty("SnapExposureDuration");
+                        if (prop != null && prop.CanRead && prop.CanWrite)
+                        {
+                            if (prop.GetValue(vm) is double cur && Math.Abs(cur - exposureSeconds) > 0.00001)
+                            {
+                                prop.SetValue(vm, exposureSeconds);
+                            }
+                        }
+                    }
+                    catch { }
+                }));
+            }
+            catch { }
+        }
+
+        private void PollAndSyncExposureTime()
+        {
+            if (_device == null) return;
+
+            try
+            {
+                var activeProfile = _profileService?.ActiveProfile;
+                double profileSnapExp = activeProfile?.SnapShotControlSettings?.ExposureDuration ?? -1.0;
+
+                // 1. If the user changed the exposure duration in NINA's Imaging / Snapshot panel,
+                // sync it to AutoFocusExposureTime and push it to the camera body.
+                if (profileSnapExp > 0 &&
+                    _lastSyncedExposureTime > 0 &&
+                    Math.Abs(profileSnapExp - _lastSyncedExposureTime) > 0.00001)
+                {
+                    double applied = profileSnapExp;
+                    uint actionType = _device.GetActionType();
+                    if (actionType != OlyCameraNative.ACTION_TYPE_BULB &&
+                        _device.SetShutterSpeed(profileSnapExp, out double matchedSec) &&
+                        matchedSec > 0)
+                    {
+                        applied = matchedSec;
+                    }
+
+                    ApplySyncedExposureTime(applied, updateUiAndProfile: true);
+                    Logger.Info($"OMCamera: Synced NINA Imaging Exposure ({profileSnapExp:F4}s -> {applied:F4}s) to Camera and AutoFocusExposureTime.");
+                    return;
+                }
+
+                // 2. If the user changed the shutter speed dial on the physical camera body,
+                // sync it into NINA's AutoFocusExposureTime and Imaging Snapshot panel.
+                double camShutter = _device.GetShutterSpeed();
+                if (camShutter > 0 &&
+                    (_lastSyncedExposureTime <= 0 || Math.Abs(camShutter - _lastSyncedExposureTime) > 0.00001))
+                {
+                    ApplySyncedExposureTime(camShutter, updateUiAndProfile: true);
+                    Logger.Info($"OMCamera: Synced Camera Shutter Speed ({camShutter:F4}s) to NINA Imaging and AutoFocusExposureTime.");
+                }
+                else if (camShutter > 0 && activeProfile?.FocuserSettings != null &&
+                         Math.Abs(activeProfile.FocuserSettings.AutoFocusExposureTime - camShutter) > 0.00001)
+                {
+                    activeProfile.FocuserSettings.AutoFocusExposureTime = camShutter;
+                }
+            }
+            catch { }
+        }
+
         private int FindApertureIndexByCode(uint code)
         {
             for (int i = 0; i < _apertureEntries.Count; i++)
@@ -575,6 +666,15 @@ namespace NINA.Plugin.OMCamera
                     sp.DataContext.GetType().Name.Contains("SnapshotVM", StringComparison.OrdinalIgnoreCase) &&
                     sp.Children.Count >= 5)
                 {
+                    if (!ReferenceEquals(_snapshotVmRef, sp.DataContext))
+                    {
+                        _snapshotVmRef = sp.DataContext;
+                        if (_lastSyncedExposureTime > 0)
+                        {
+                            UpdateSnapshotVmExposureOnDispatcher(_lastSyncedExposureTime);
+                        }
+                    }
+
                     foreach (UIElement existing in sp.Children)
                     {
                         if (existing is Border existingBorder && (existingBorder.Tag as string) == "OMCamera_ApertureRow")
@@ -725,6 +825,7 @@ namespace NINA.Plugin.OMCamera
                 if (!_isBulb)
                 {
                     _exposureDuration = matchedShutter;
+                    ApplySyncedExposureTime(matchedShutter, updateUiAndProfile: true);
                 }
             }
 

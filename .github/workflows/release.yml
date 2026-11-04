@@ -67,7 +67,7 @@ jobs:
           $shaShort = "${{ github.sha }}".Substring(0, 7)
           $versionLabel = if ($refName -like "v*") { $refName } else { "dev-$shaShort" }
 
-          $tag = if ($refName -like "v*") { $refName.TrimStart('v') } else { "1.2.0.0" }
+          $tag = if ($refName -like "v*") { $refName.TrimStart('v') } else { "1.3.0.0" }
           $parts = $tag.Split('-')[0].Split('.')
           while ($parts.Count -lt 4) { $parts += "0" }
 

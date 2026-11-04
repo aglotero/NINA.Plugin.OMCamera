@@ -55,8 +55,8 @@ namespace NINA.Plugin.OMCamera
         public string DisplayName { get; private set; }
         public string Category => "Focuser";
         public string Description { get; }
-        public string DriverInfo => "OM System Native REA Focuser Driver v1.2";
-        public string DriverVersion => "1.2.0";
+        public string DriverInfo => "OM System Native REA Focuser Driver v1.3";
+        public string DriverVersion => "1.3.0";
         public bool HasSetupDialog => false;
         public IList<string> SupportedActions => new List<string> { "ResetPosition", "UnlockAutoFocus" };
 

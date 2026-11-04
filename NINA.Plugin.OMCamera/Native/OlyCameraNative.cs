@@ -245,6 +245,16 @@ namespace NINA.Plugin.OMCamera.Native
         public const uint ACTION_1ST_2ND_RELEASE = 6;   // Half+Full press OFF ([pCam+0x43B]=0x0000) -> Stop Bulb / Release All
         public const uint ACTION_SINGLE_SHOT = 10;      // Auto Single Shot (1 -> wait AF -> 2 -> 6)
 
+        // Focus Adjust Directions verified from IOlyCamera::SetFocusAdjust (Slot 57, RVA 0x0F960)
+        // and IOlyCamera::SetFocusAdjustPulse (Slot 58, RVA 0x0FC40):
+        public const uint FOCUS_DIRECTION_NEAR = 1;     // Drive lens focus toward Near / Close (In)
+        public const uint FOCUS_DIRECTION_FAR = 2;      // Drive lens focus toward Far / Infinity (Out)
+        public const uint FOCUS_DIRECTION_STOP = 3;     // Stop / Reset focus pulse drive (Slot 58 only)
+
+        // Native HRESULT codes returned by SetFocusAdjust / SetFocusAdjustPulse in OlyCameraLib.dll:
+        public const int OLY_ERR_NOT_SUPPORTED = unchecked((int)0x80048013);
+        public const int OLY_ERR_IN_AUTOFOCUS = unchecked((int)0x80048116);
+
         public static bool EnsureInitialized()
         {
             lock (_syncLock)

@@ -56,8 +56,13 @@ jobs:
         run: dotnet test NINA.Plugin.OMCamera.sln -c Release --no-build --verbosity normal
 
       - name: Package plugin artifacts & generate NINA manifest.json
+        id: package
         shell: pwsh
         run: |
+          $rawRef = if ("${{ github.head_ref }}") { "${{ github.head_ref }}" } else { "${{ github.ref_name }}" }
+          $safeRef = $rawRef -replace '[^a-zA-Z0-9._-]', '-'
+          "artifact_suffix=$safeRef" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
           $refName = "${{ github.ref_name }}"
           $shaShort = "${{ github.sha }}".Substring(0, 7)
           $versionLabel = if ($refName -like "v*") { $refName } else { "dev-$shaShort" }
@@ -102,7 +107,7 @@ jobs:
             License = "MIT"
             LicenseURL = "https://opensource.org/licenses/MIT"
             ChangelogURL = "https://github.com/aglotero/NINA.Plugin.OMCamera/releases"
-            Tags = @("Camera", "OM System", "Olympus", "OM-1", "Mirrorless", "DSLR")
+            Tags = @("Camera", "Focuser", "OM System", "Olympus", "OM-1", "Mirrorless", "DSLR")
             MinimumApplicationVersion = [ordered]@{
               Major = 3
               Minor = 2
@@ -110,8 +115,8 @@ jobs:
               Build = 9001
             }
             Descriptions = [ordered]@{
-              ShortDescription = "Native camera driver for OM System and Olympus mirrorless cameras in N.I.N.A."
-              LongDescription = "Provides native USB tethered RAW (.ORF) capture, 16-bit ADU scaling, Bulb & Timed exposures, bidirectional ISO (Gain), Shutter Speed, Lens Aperture (f-stop), and LiveView control for OM System and Olympus OM-D mirrorless cameras (OM-1, OM-1 Mark II, OM-5, E-M1X, E-M1 Mark II/III, E-M5 Mark II/III) via OM Workspace's OlyCameraLib."
+              ShortDescription = "Native camera and electronic lens focuser driver for OM System and Olympus mirrorless cameras in N.I.N.A."
+              LongDescription = "Provides native USB tethered RAW (.ORF) capture, 16-bit ADU scaling, Bulb & Timed exposures, electronic lens focus control (IFocuser & AutoFocus), bidirectional ISO (Gain), Shutter Speed, Lens Aperture (f-stop), and LiveView control for OM System and Olympus OM-D mirrorless cameras (OM-1, OM-1 Mark II, OM-5, E-M1X, E-M1 Mark II/III, E-M5 Mark II/III) via OM Workspace's OlyCameraLib."
               FeaturedImageURL = ""
               ScreenshotURL = ""
               AltScreenshotURL = ""
@@ -128,7 +133,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: NINA.Plugin.OMCamera-${{ github.ref_name }}
+          name: NINA.Plugin.OMCamera-${{ steps.package.outputs.artifact_suffix }}
           path: |
             dist/NINA.Plugin.OMCamera.dll
             dist/NINA.Plugin.OMCamera.zip
